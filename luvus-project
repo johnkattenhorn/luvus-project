@@ -15,6 +15,9 @@
 #   luvus-project default         open the shared default session (~/.luvus)
 #   luvus-project --list          print the configured projects
 #
+# Projects are ordered by when they were last worked on, newest first, so the
+# rows in play sit at the top of the picker.
+#
 # The picker always ends with two rows, whatever is configured:
 #   Open the default session   the shared ~/.luvus session and its ledger
 #   Add a project…             pick a git checkout, record it, open it
@@ -29,6 +32,8 @@ set -euo pipefail
 
 CONFIG="${LUVUS_PROJECTS_CONFIG:-$HOME/.config/luvus/projects.conf}"
 CODE_DIR="${LUVUS_CODE_DIR:-$HOME/Code}"
+# LUVUS_HOME is luvus's own variable; follow it rather than inventing another.
+SESSIONS_DIR="${LUVUS_HOME:-$HOME/.luvus}/sessions"
 APP_ID_PREFIX="org.omarchy.luvus"
 DEFAULT_NAME="default"
 DEFAULT_ROW="Open the default session"
@@ -53,6 +58,66 @@ projects() {
     name=$(basename "$dir")
     printf '%s\t%s\n' "$name" "${dir%/}"
   done
+}
+
+# --- ordering ---------------------------------------------------------------
+# Most recently worked-on project first, so the picker opens on the rows that
+# are actually in play.
+#
+# "Worked on" is session activity, not commits: the ledger, task board and
+# leases all live in the session, so it moves when you use a project rather
+# than only when you commit to it. Take the newest file anywhere under the
+# session directory, which keeps a running session with a live agent at the
+# top -- session.json alone only moves on a layout change, so a session busy
+# for hours can still look untouched.
+#
+# A project with no session yet falls back to its checkout: the last commit,
+# or for a path that merely groups several checkouts the newest commit in any
+# of them, so a grouping directory ages with its repositories. No git history
+# at all falls back to the path's mtime, and a path that has gone missing
+# sorts last rather than breaking the picker.
+session_activity() {  # $1 = session name -> unix timestamp, empty if no session
+  local dir="$SESSIONS_DIR/$1"
+  [ -d "$dir" ] || return 0
+  find "$dir" -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1 | cut -d. -f1 || true
+}
+
+last_commit() {  # $1 = a checkout -> unix timestamp, empty when not a checkout
+  local path top
+  path=$(cd -- "$1" 2>/dev/null && pwd -P) || return 0
+  # git searches upwards, so a directory that merely sits inside a repository
+  # would otherwise report that repository's history as its own. Only a path
+  # that is itself the top of a checkout counts.
+  top=$(git -C "$path" rev-parse --show-toplevel 2>/dev/null) || return 0
+  [ "$top" = "$path" ] || return 0
+  git -C "$path" log -1 --format=%ct 2>/dev/null || true
+}
+
+updated_at() {  # $1 = session name, $2 = path -> unix timestamp
+  local path="$2" newest=0 stamp dir
+  stamp=$(session_activity "$1")
+  if [ -n "$stamp" ]; then printf '%s\n' "$stamp"; return; fi
+  [ -d "$path" ] || { printf '0\n'; return; }
+  stamp=$(last_commit "$path")
+  if [ -n "$stamp" ]; then printf '%s\n' "$stamp"; return; fi
+  for dir in "$path"/*/; do
+    stamp=$(last_commit "$dir")
+    if [ -n "$stamp" ] && [ "$stamp" -gt "$newest" ]; then newest=$stamp; fi
+  done
+  if [ "$newest" -eq 0 ]; then
+    newest=$(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null || printf '0')
+  fi
+  printf '%s\n' "$newest"
+}
+
+# "name<TAB>path" lines in, the same lines out, newest first. Equal timestamps
+# keep their configured order: -s makes the sort stable rather than arbitrary.
+by_recency() {
+  local name path
+  while IFS=$'\t' read -r name path; do
+    [ -n "$name" ] || continue
+    printf '%s\t%s\t%s\n' "$(updated_at "$name" "$path")" "$name" "$path"
+  done | sort -s -rn -k1,1 | cut -f2-
 }
 
 # Session names luvus already has running, one per line.
@@ -147,11 +212,11 @@ notify() {
 # --- arguments --------------------------------------------------------------
 case "${1:-}" in
   --list|-l)
-    projects | while IFS=$'\t' read -r name path; do printf '%-24s %s\n' "$name" "$path"; done
+    projects | by_recency | while IFS=$'\t' read -r name path; do printf '%-24s %s\n' "$name" "$path"; done
     exit 0
     ;;
   --help|-h)
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac
@@ -184,7 +249,7 @@ while IFS=$'\t' read -r name path; do
     glyph=""     # not started yet
   fi
   rows+=("$glyph"$'\t'"$name"$'\t'"$path")
-done <<< "$list"
+done <<< "$(printf '%s\n' "$list" | by_recency)"
 
 # Two rows are always offered, after the projects. Their labels contain spaces,
 # which a session name may not, so they can never collide with a project.

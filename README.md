@@ -66,6 +66,22 @@ luvus-project default    # the shared ~/.luvus session
 luvus-project --list
 ```
 
+**Ordering.** Projects are listed newest first, by when each was last worked
+on, so the ones in play sit at the top and `--list` shows the same order.
+
+"Worked on" means session activity, not commits: the ledger, task board and
+leases live in the session, so it moves when you *use* a project rather than
+only when you commit to it. The date is the newest file anywhere under
+`~/.luvus/sessions/<name>`, which keeps a running session with a live agent at
+the top. `session.json` alone is not enough — it only moves on a layout
+change, so a session busy for hours can still look untouched.
+
+A project with no session yet falls back to its checkout: the last commit, or
+for a path that merely groups several checkouts the newest commit in any of
+them, so a grouping directory ages with its repositories. No git history at
+all falls back to the path's mtime, and a missing path sorts last. Ties keep
+their configured order.
+
 The picker always ends with two rows. **Open the default session** reaches
 `~/.luvus` and its ledger, which otherwise has no route through the picker.
 **Add a project…** lists the git checkouts under `~/Code` that are not
