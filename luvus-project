@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# luvus-project — open or focus a Luvus session for one project.
+#
+# Luvus keeps its orchestration ledger, path leases and task board per SESSION,
+# not per workspace, so two projects sharing a session collide: a path lease in
+# one repository refuses a lane in the other, and `task next` will hand a lane
+# from one project to an agent standing in the other. One session per project
+# avoids both. See RizRiyz/luvus#359.
+#
+# Each project gets its own window identity, org.omarchy.luvus.<name>, so this
+# focuses the project's existing window instead of opening a second one.
+#
+#   luvus-project                 pick a project, then open or focus it
+#   luvus-project <name>          skip the picker
+#   luvus-project default         open the shared default session (~/.luvus)
+#   luvus-project --list          print the configured projects
+#
+# The picker always ends with two rows, whatever is configured:
+#   Open the default session   the shared ~/.luvus session and its ledger
+#   Add a project…             pick a git checkout, record it, open it
+#
+# Projects come from ~/.config/luvus/projects.conf, one per line:
+#
+#   name<space or tab>/path/to/checkout
+#   # comments and blank lines are ignored
+#
+# With no config file, every git checkout directly under ~/Code is offered.
+set -euo pipefail
+
+CONFIG="${LUVUS_PROJECTS_CONFIG:-$HOME/.config/luvus/projects.conf}"
+CODE_DIR="${LUVUS_CODE_DIR:-$HOME/Code}"
+APP_ID_PREFIX="org.omarchy.luvus"
+DEFAULT_NAME="default"
+DEFAULT_ROW="Open the default session"
+ADD_ROW="Add a project…"
+# The luvus binary a session runs. Override to test a build.
+LUVUS_BIN="${LUVUS_BIN:-luvus}"
+
+die() { printf 'luvus-project: %s\n' "$*" >&2; exit 1; }
+
+# --- the project list -------------------------------------------------------
+# Emits "name<TAB>path" per line.
+projects() {
+  if [ -r "$CONFIG" ]; then
+    sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$CONFIG" \
+      | awk 'NF >= 2 { name = $1; $1 = ""; sub(/^[[:space:]]+/, ""); print name "\t" $0 }'
+    return
+  fi
+  # No config: offer every git checkout directly under the code directory.
+  local dir name
+  for dir in "$CODE_DIR"/*/; do
+    [ -d "$dir/.git" ] || continue
+    name=$(basename "$dir")
+    printf '%s\t%s\n' "$name" "${dir%/}"
+  done
+}
+
+# Session names luvus already has running, one per line.
+running_sessions() {
+  command -v "$LUVUS_BIN" >/dev/null 2>&1 || return 0
+  "$LUVUS_BIN" session list --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for session in data.get("sessions", []):
+    if session.get("running"):
+        print(session.get("name", ""))
+' 2>/dev/null || true
+}
+
+open_project() {  # $1 = name, $2 = path
+  local name="$1" path="$2"
+  [ -d "$path" ] || die "$name: $path does not exist"
+  local app_id="$APP_ID_PREFIX.$name"
+  # cd into the checkout so a brand-new session adopts it as its workspace.
+  cd "$path"
+  # Strip an inherited session identity. Picking from inside a luvus pane would
+  # otherwise leak that pane's LUVUS_* into the new TUI. `--session` already
+  # wins, but the stale LUVUS_PANE_ID and socket paths confuse anything the new
+  # session spawns. "default" is a real target name: it resolves to ~/.luvus and
+  # creates no sessions/default directory.
+  exec env -u LUVUS_SESSION -u LUVUS_SOCKET_PATH -u LUVUS_API_ADDRESS \
+           -u LUVUS_PANE_ID -u LUVUS_ENV \
+    omarchy-launch-or-focus-tui "--app-id=$app_id" "$LUVUS_BIN" --session "$name"
+}
+
+# Git checkouts under the code directory that the config does not list yet.
+unconfigured() {
+  local known_paths known_names dir name
+  known_paths=$(projects | cut -f2)
+  known_names=$(projects | cut -f1)
+  for dir in "$CODE_DIR"/*/; do
+    dir="${dir%/}"
+    [ -d "$dir/.git" ] || continue
+    printf '%s\n' "$known_paths" | grep -qxF "$dir" && continue
+    name=$(basename "$dir")
+    # Two checkouts can share a basename. A session name must stay unique, so
+    # skip rather than write a second row the picker could not tell apart.
+    printf '%s\n' "$known_names" | grep -qxF "$name" && continue
+    [ "$name" = "$DEFAULT_NAME" ] && continue
+    printf '%s\t%s\n' "$name" "$dir"
+  done
+}
+
+# Pick an unconfigured checkout, record it, then open it.
+add_project() {
+  local candidates rows=() choice name path
+  candidates=$(unconfigured)
+  if [ -z "$candidates" ]; then
+    notify "Luvus" "Every git checkout in $CODE_DIR is already configured."
+    exit 0
+  fi
+  while IFS=$'\t' read -r name path; do
+    [ -n "$name" ] || continue
+    rows+=(""$'\t'"$name"$'\t'"$path")
+  done <<< "$candidates"
+
+  choice=$(omarchy-menu-select "Add a Luvus project" "${rows[@]}" -- --width 520 || true)
+  [ -n "$choice" ] || exit 0
+  name="${choice%%$'\t'*}"
+  path="${choice#*$'\t'}"
+  if [ "$path" = "$choice" ]; then
+    path=$(printf '%s\n' "$candidates" | awk -F'\t' -v w="$name" '$1 == w { print $2; exit }')
+  fi
+  [ -n "$path" ] || die "could not resolve a path for '$name'"
+  # Never write a row the parser would read back as something else. A session
+  # name is one token; a path must exist. Without this a menu that returns an
+  # unexpected string appends a junk row that then appears in every later menu.
+  case "$name" in
+    *[[:space:]]*|"") die "refusing to record '$name': a session name is one word" ;;
+  esac
+  [ -d "$path/.git" ] || die "refusing to record '$name': $path is not a git checkout"
+
+  mkdir -p "$(dirname "$CONFIG")"
+  [ -f "$CONFIG" ] || printf '# luvus-project: one session per project.\n# Format: <session-name> <path to the checkout>\n' > "$CONFIG"
+  printf '%-21s %s\n' "$name" "$path" >> "$CONFIG"
+  notify "Luvus" "Added $name to $CONFIG"
+  open_project "$name" "$path"
+}
+
+notify() {
+  command -v notify-send >/dev/null 2>&1 && notify-send "$1" "$2" || printf '%s: %s\n' "$1" "$2" >&2
+}
+
+# --- arguments --------------------------------------------------------------
+case "${1:-}" in
+  --list|-l)
+    projects | while IFS=$'\t' read -r name path; do printf '%-24s %s\n' "$name" "$path"; done
+    exit 0
+    ;;
+  --help|-h)
+    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+esac
+
+list=$(projects)
+[ -n "$list" ] || die "no projects configured in $CONFIG and no git checkouts in $CODE_DIR"
+
+if [ $# -gt 0 ]; then
+  wanted="$1"
+  # "default" is always reachable by name, configured or not.
+  [ "$wanted" = "$DEFAULT_NAME" ] && open_project "$DEFAULT_NAME" "$HOME"
+  match=$(printf '%s\n' "$list" | awk -F'\t' -v w="$wanted" '$1 == w { print; exit }')
+  [ -n "$match" ] || die "unknown project '$wanted' (try --list)"
+  open_project "${match%%$'\t'*}" "${match#*$'\t'}"
+fi
+
+# --- the picker -------------------------------------------------------------
+# omarchy-menu-select rows may be "<glyph><TAB><label><TAB><subtext>". It shows
+# the glyph, never returns it, and returns "<label><TAB><subtext>" when a
+# subtext is present. Use the path as the subtext so it comes back as a key.
+command -v omarchy-menu-select >/dev/null 2>&1 || die "omarchy-menu-select not found"
+
+live=$(running_sessions)
+rows=()
+while IFS=$'\t' read -r name path; do
+  [ -n "$name" ] || continue
+  if printf '%s\n' "$live" | grep -qxF "$name"; then
+    glyph=""     # already running, this will focus it
+  else
+    glyph=""     # not started yet
+  fi
+  rows+=("$glyph"$'\t'"$name"$'\t'"$path")
+done <<< "$list"
+
+# Two rows are always offered, after the projects. Their labels contain spaces,
+# which a session name may not, so they can never collide with a project.
+rows+=(""$'\t'"$DEFAULT_ROW"$'\t'"~/.luvus · the shared ledger")
+rows+=(""$'\t'"$ADD_ROW"$'\t'"pick a git checkout in $CODE_DIR")
+
+choice=$(omarchy-menu-select "Luvus project" "${rows[@]}" -- --width 520 || true)
+[ -n "$choice" ] || exit 0
+
+name="${choice%%$'\t'*}"
+path="${choice#*$'\t'}"
+
+case "$name" in
+  "$DEFAULT_ROW") open_project "$DEFAULT_NAME" "$HOME" ;;
+  "$ADD_ROW")     add_project ;;
+esac
+
+# Defend against a menu that returns only the label.
+if [ "$path" = "$choice" ]; then
+  path=$(printf '%s\n' "$list" | awk -F'\t' -v w="$name" '$1 == w { print $2; exit }')
+fi
+[ -n "$path" ] || die "could not resolve a path for '$name'"
+
+open_project "$name" "$path"
