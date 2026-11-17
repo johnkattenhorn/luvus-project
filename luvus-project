@@ -14,6 +14,7 @@
 #   luvus-project <name>          skip the picker
 #   luvus-project default         open the shared default session (~/.luvus)
 #   luvus-project --list          print the configured projects
+#   luvus-project --version       print the version
 #
 # The picker always ends with two rows, whatever is configured:
 #   Open the default session   the shared ~/.luvus session and its ledger
@@ -26,6 +27,9 @@
 #
 # With no config file, every git checkout directly under ~/Code is offered.
 set -euo pipefail
+
+# The one version of this tool (semver); a release is the git tag v<VERSION>.
+VERSION="0.1.0"
 
 CONFIG="${LUVUS_PROJECTS_CONFIG:-$HOME/.config/luvus/projects.conf}"
 CODE_DIR="${LUVUS_CODE_DIR:-$HOME/Code}"
@@ -150,8 +154,12 @@ case "${1:-}" in
     projects | while IFS=$'\t' read -r name path; do printf '%-24s %s\n' "$name" "$path"; done
     exit 0
     ;;
+  --version|-V)
+    printf 'luvus-project %s\n' "$VERSION"
+    exit 0
+    ;;
   --help|-h)
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac
